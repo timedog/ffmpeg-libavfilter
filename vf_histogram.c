@@ -24,6 +24,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libswscale/swscale.h"
 #include "avfilter.h"
 #include "formats.h"
 #include "internal.h"
@@ -31,7 +32,7 @@
 
 typedef struct HistogramContext {
     const AVClass *class;               ///< AVClass context for log and options purpose
-    unsigned       histogram[256*256];
+    unsigned       histogram[4*256];
     int            histogram_size;
     int            mult;
     int            ncomp;
@@ -75,6 +76,8 @@ static const AVOption histogram_options[] = {
 AVFILTER_DEFINE_CLASS(histogram);
 
 static const enum AVPixelFormat levels_in_pix_fmts[] = {
+	AV_PIX_FMT_YUV444P,
+/*
     AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P,
     AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUVJ422P,
     AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUVJ411P,
@@ -89,11 +92,13 @@ static const enum AVPixelFormat levels_in_pix_fmts[] = {
     AV_PIX_FMT_GBRP9,    AV_PIX_FMT_GBRP10,
     AV_PIX_FMT_GBRP12,   AV_PIX_FMT_GBRAP12,
     AV_PIX_FMT_GRAY8,
+*/
     AV_PIX_FMT_NONE
 };
 
 static const enum AVPixelFormat levels_out_yuv8_pix_fmts[] = {
-    AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUV444P,
+    /*AV_PIX_FMT_YUVA444P,*/
+     AV_PIX_FMT_YUV444P,
     AV_PIX_FMT_NONE
 };
 
@@ -183,19 +188,27 @@ static int query_formats(AVFilterContext *ctx)
     return 0;
 }
 
-static const uint8_t black_yuva_color[4] = { 0, 127, 127, 255 };
+static const uint8_t black_yuva_color[4] = { 50, 127, 127, 255 };
 static const uint8_t black_gbrp_color[4] = { 0, 0, 0, 255 };
 static const uint8_t white_yuva_color[4] = { 255, 127, 127, 255 };
 static const uint8_t white_gbrp_color[4] = { 255, 255, 255, 255 };
+
+static const uint8_t red_yuva_color[4]   = { 0x51, 0x5a, 0xf0, 255 };
+static const uint8_t green_yuva_color[4] = { 0x90, 0x36, 0x22, 255 };
+static const uint8_t blue_yuva_color[4]  = { 0x51, 0xf0, 0x6e, 255 };
 
 static int config_input(AVFilterLink *inlink)
 {
     HistogramContext *h = inlink->dst->priv;
 
     h->desc  = av_pix_fmt_desc_get(inlink->format);
-    h->ncomp = h->desc->nb_components;
+    //h->ncomp = h->desc->nb_components;
+	h->ncomp = 4;//y,r,g,b
     h->histogram_size = 1 << h->desc->comp[0].depth;
     h->mult = h->histogram_size / 256;
+
+	if(h->histogram_size > 256)
+		return AVERROR(EINVAL);
 
     switch (inlink->format) {
     case AV_PIX_FMT_GBRP12:
@@ -215,7 +228,7 @@ static int config_input(AVFilterLink *inlink)
     h->bg_color[3] = h->bgopacity * 255;
 
     h->planeheight[1] = h->planeheight[2] = AV_CEIL_RSHIFT(inlink->h, h->desc->log2_chroma_h);
-    h->planeheight[0] = h->planeheight[3] = inlink->h;
+    h->planeheight[0] = h->planeheight[3] = inlink->h;//y和透明度的高(input图像的)
     h->planewidth[1]  = h->planewidth[2]  = AV_CEIL_RSHIFT(inlink->w, h->desc->log2_chroma_w);
     h->planewidth[0]  = h->planewidth[3]  = inlink->w;
 
@@ -226,14 +239,21 @@ static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     HistogramContext *h = ctx->priv;
-    int ncomp = 0, i;
-
-    for (i = 0; i < h->ncomp; i++) {
-        if ((1 << i) & h->components)
-            ncomp++;
-    }
-    outlink->w = h->histogram_size;
-    outlink->h = (h->level_height + h->scale_height) * FFMAX(ncomp * h->display_mode, 1);
+	/* 输出图像的尺寸，放置方式是
+	 *     |<-------------->| 原始图像width
+	 * +---+----------------+
+	 * | 直|            	|
+	 * | 方|                | 原始图像height
+	 * | 图|                |
+	 * |   |				|
+	 * |   |    			|
+	 * +---+----------------+
+	 * 
+	 */
+	h->level_height = h->planeheight[0]/4;
+	h->scale_height = 0;
+    outlink->w = h->planewidth[0] + h->histogram_size;
+    outlink->h = h->planeheight[0];
 
     h->odesc = av_pix_fmt_desc_get(outlink->format);
     outlink->sample_aspect_ratio = (AVRational){1,1};
@@ -241,13 +261,58 @@ static int config_output(AVFilterLink *outlink)
     return 0;
 }
 
+static AVFrame * frame2rgb(AVFrame *in)
+{
+	AVFrame * rgb;
+	uint8_t * b;
+	struct SwsContext * sws_ctx;
+	
+	rgb = av_frame_alloc();
+	if(!rgb) goto out;
+	
+	rgb->width = in->width;
+	rgb->height = in->height;
+	
+	b = (uint8_t *)malloc(in->width*in->height*3);
+	if(!b)
+	{
+		av_frame_free(&rgb);
+		goto out;
+	}
+	
+	rgb->data[0] = &b[0];
+	rgb->data[1] = &b[in->width*in->height*1];
+	rgb->data[2] = &b[in->width*in->height*2];
+
+	rgb->linesize[0] =
+	rgb->linesize[1] =
+	rgb->linesize[2] = in->width;
+
+	sws_ctx = sws_getContext(in->width,in->height,AV_PIX_FMT_YUV444P,
+							 in->width,in->height,AV_PIX_FMT_GBRP,
+							 SWS_FAST_BILINEAR,NULL,
+							 NULL,NULL);	
+	if (sws_ctx) {
+		sws_scale(sws_ctx,(const uint8_t *const *)in->data,
+				  in->linesize,0,in->height,
+				  rgb->data,rgb->linesize);
+		sws_freeContext(sws_ctx);
+	}
+out:
+	return rgb;
+}
+
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     HistogramContext *h   = inlink->dst->priv;
     AVFilterContext *ctx  = inlink->dst;
     AVFilterLink *outlink = ctx->outputs[0];
-    AVFrame *out;
+    AVFrame *out,*rgb;
     int i, j, k, l, m;
+	uint8_t *data[4],
+			*p_fg_color[4] = {(uint8_t *)white_yuva_color,(uint8_t *)red_yuva_color,
+							  (uint8_t *)green_yuva_color,(uint8_t *)blue_yuva_color};
 
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!out) {
@@ -257,58 +322,62 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     out->pts = in->pts;
 
+	if((rgb = frame2rgb(in)) == NULL)
+	{
+        av_frame_free(&in);
+		av_frame_free(&out);
+        return AVERROR(ENOMEM);
+	}
+
+    //background
     for (k = 0; k < 4 && out->data[k]; k++) {
-        const int is_chroma = (k == 1 || k == 2);
-        const int dst_h = AV_CEIL_RSHIFT(outlink->h, (is_chroma ? h->odesc->log2_chroma_h : 0));
-        const int dst_w = AV_CEIL_RSHIFT(outlink->w, (is_chroma ? h->odesc->log2_chroma_w : 0));
+        const int dst_h = outlink->h;
+        const int histogram_w = h->histogram_size;
 
-        if (h->histogram_size <= 256) {
-            for (i = 0; i < dst_h ; i++)
-                memset(out->data[h->odesc->comp[k].plane] +
-                       i * out->linesize[h->odesc->comp[k].plane],
-                       h->bg_color[k], dst_w);
-        } else {
-            const int mult = h->mult;
-
-            for (i = 0; i < dst_h ; i++)
-                for (j = 0; j < dst_w; j++)
-                    AV_WN16(out->data[h->odesc->comp[k].plane] +
-                        i * out->linesize[h->odesc->comp[k].plane] + j * 2,
-                        h->bg_color[k] * mult);
-        }
+		for (i = 0; i < dst_h ; i++)
+		{
+			uint8_t * p_back_dst = out->data[h->odesc->comp[k].plane] +
+									i * out->linesize[h->odesc->comp[k].plane];
+			uint8_t * p_data_dst = p_back_dst + h->histogram_size;
+			uint8_t * p_data_src = in->data[h->desc->comp[k].plane] +
+									i * in->linesize[h->desc->comp[k].plane];
+									
+			memset(p_back_dst,h->bg_color[k], histogram_w);
+			memcpy(p_data_dst,p_data_src,in->linesize[h->desc->comp[k].plane]);
+		}
     }
 
+	data[0] = in->data[0];
+	data[1] = rgb->data[2];
+	data[2] = rgb->data[0];
+	data[3] = rgb->data[1];
+
+//k=0，表示input中的y分量；这个loop是逐个绘制直方图的循环，每次绘制1个直方图
     for (m = 0, k = 0; k < h->ncomp; k++) {
-        const int p = h->desc->comp[k].plane;
-        const int height = h->planeheight[p];
-        const int width = h->planewidth[p];
+        const int p = h->desc->comp[k].plane;//be careful
+        const int height = h->planeheight[p];//height of input
+        const int width = h->planewidth[p];//width of input
         double max_hval_log;
         unsigned max_hval = 0;
         int start;
 
-        if (!((1 << k) & h->components))
-            continue;
+        // if (!((1 << k) & h->components))
+        //     continue;
         start = m++ * (h->level_height + h->scale_height) * h->display_mode;
 
-        if (h->histogram_size <= 256) {
-            for (i = 0; i < height; i++) {
-                const uint8_t *src = in->data[p] + i * in->linesize[p];
-                for (j = 0; j < width; j++)
-                    h->histogram[src[j]]++;
-            }
-        } else {
-            for (i = 0; i < height; i++) {
-                const uint16_t *src = (const uint16_t *)(in->data[p] + i * in->linesize[p]);
-                for (j = 0; j < width; j++)
-                    h->histogram[src[j]]++;
-            }
-        }
+		memset(h->histogram, 0, h->histogram_size * sizeof(unsigned));
+//统计
+		for (i = 0; i < height; i++) {
+			const uint8_t *src = data[k] + i * in->linesize[0];//src指向每一条line的开头
+			for (j = 0; j < width; j++)
+				h->histogram[src[j]]++;
+		}
 
         for (i = 0; i < h->histogram_size; i++)
             max_hval = FFMAX(max_hval, h->histogram[i]);
         max_hval_log = log2(max_hval + 1);
-
-        for (i = 0; i < outlink->w; i++) {
+//画图
+        for (i = 0; i < h->histogram_size; i++) {//i=列号=level
             int col_height;
 
             if (h->levels_mode)
@@ -316,40 +385,28 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             else
                 col_height = h->level_height - (h->histogram[i] * (int64_t)h->level_height + max_hval - 1) / max_hval;
 
-            if (h->histogram_size <= 256) {
-                for (j = h->level_height - 1; j >= col_height; j--) {
-                    if (h->display_mode) {
-                        for (l = 0; l < h->ncomp; l++)
-                            out->data[l][(j + start) * out->linesize[l] + i] = h->fg_color[l];
-                    } else {
-                        out->data[p][(j + start) * out->linesize[p] + i] = 255;
-                    }
-                }
-                for (j = h->level_height + h->scale_height - 1; j >= h->level_height; j--)
-                    out->data[p][(j + start) * out->linesize[p] + i] = i;
-            } else {
-                const int mult = h->mult;
-
-                for (j = h->level_height - 1; j >= col_height; j--) {
-                    if (h->display_mode) {
-                        for (l = 0; l < h->ncomp; l++)
-                            AV_WN16(out->data[l] + (j + start) * out->linesize[l] + i * 2, h->fg_color[l] * mult);
-                    } else {
-                        AV_WN16(out->data[p] + (j + start) * out->linesize[p] + i * 2, 255 * mult);
-                    }
-                }
-                for (j = h->level_height + h->scale_height - 1; j >= h->level_height; j--)
-                    AV_WN16(out->data[p] + (j + start) * out->linesize[p] + i * 2, i);
-            }
+			for (j = h->level_height - 1; j >= col_height; j--) {
+				if (h->display_mode) {
+					for (l = 0; l < h->odesc->nb_components; l++)//l=0,y分量
+						out->data[l][(j + start) * out->linesize[l] + i] = p_fg_color[k][l];
+				} else {
+					out->data[p][(j + start) * out->linesize[p] + i] = 255;
+				}
+			}
+			for (j = h->level_height + h->scale_height - 1; j >= h->level_height; j--)
+				out->data[p][(j + start) * out->linesize[p] + i] = i;//如果是y的直方图就只改变Y
         }
 
-        memset(h->histogram, 0, h->histogram_size * sizeof(unsigned));
+        //memset(h->histogram, 0, h->histogram_size * sizeof(unsigned));
     }
 
     av_frame_free(&in);
+	free(rgb->data[0]);
+	av_frame_free(&rgb);
     return ff_filter_frame(outlink, out);
 }
 
+// AVFilterPad , which is used to describe the inputs and outputs of the filter
 static const AVFilterPad inputs[] = {
     {
         .name         = "default",
