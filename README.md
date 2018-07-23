@@ -2,6 +2,7 @@ FFMPEG-LIBAVFILTER README
 =========================
 ## vf_histogram.c
 修改**FFmpeg histogram filter** : 添加了`display_mode` : `video`，该`display_mode`可以使直方图和原始图像一起输出，形如：
+<img align="right" src="https://github.com/timedog/ffmpeg-libavfilter/blob/master/vf_histogram.png" width="428" height="200">
 ```
       直方图             图像
     +---------+--------------------------+
